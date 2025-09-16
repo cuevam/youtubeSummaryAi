@@ -1,9 +1,13 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from openai import OpenAI
-import json, os
+from faster_whisper import WhisperModel
+from requests.exceptions import ConnectionError as RequestsConnectionError, Timeout
 
-import re, os, tempfile
+
+import json, os, re, tempfile
+import yt_dlp
 
 from youtube_transcript_api import (
     YouTubeTranscriptApi,
@@ -13,9 +17,12 @@ from youtube_transcript_api import (
 )
 from xml.etree.ElementTree import ParseError
 
+# near your imports
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
 # Whisper fallback deps
-from faster_whisper import WhisperModel
-import yt_dlp
 
 app = FastAPI()
 
@@ -23,7 +30,6 @@ app = FastAPI()
 def health():
     return {"status": "ok"}
 
-from fastapi.responses import RedirectResponse  # add near the other imports
 
 @app.get("/")
 def root():
@@ -51,6 +57,7 @@ def _whisper_fallback(url: str):
             "outtmpl": outtmpl,
             "quiet": True,
             "no_warnings": True,
+            "socket_timeout": 20,
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "mp3",
@@ -64,7 +71,7 @@ def _whisper_fallback(url: str):
         audio_path = audio_mp3 if os.path.exists(audio_mp3) else outtmpl.replace("%(ext)s", "webm")
 
         # 2) Transcribe (CPU)
-        model_name = os.environ.get("WHISPER_MODEL", "base")
+        model_name = os.environ.get("WHISPER_MODEL", "tiny.en")
         model = WhisperModel(model_name, device="cpu", compute_type="int8")
         segments, _ = model.transcribe(audio_path)
 
@@ -116,7 +123,7 @@ def get_transcript(body: TranscriptReq):
         ]
         return {"video_id": vid, "source": source, "items": items}
 
-    except (NoTranscriptFound, TranscriptsDisabled, ParseError):
+    except (NoTranscriptFound, TranscriptsDisabled, ParseError, RequestsConnectionError, Timeout):
         # Fallback to Whisper
         try:
             items = _whisper_fallback(body.url)
@@ -127,6 +134,7 @@ def get_transcript(body: TranscriptReq):
             raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Whisper fallback error: {type(e).__name__}")
+
 
     except VideoUnavailable:
         raise HTTPException(status_code=404, detail="Video unavailable or restricted.")
@@ -140,17 +148,23 @@ class AnalyzeReq(BaseModel):
 
 @app.post("/analyze")
 def analyze(body: AnalyzeReq):
-    # reuse our transcript function
-    tr = get_transcript(TranscriptReq(url=body.url))
+    # get transcript (this should already handle captions + Whisper fallback)
+    try:
+        tr = get_transcript(TranscriptReq(url=body.url))
+    except HTTPException as e:
+        # bubble up transcript errors (e.g., private/blocked video)
+        raise e
+
+    # join with timestamps to help the model anchor claims
     lines = [f"[{it['ts']}] {it['text']}" for it in tr["items"]]
     joined = "\n".join(lines)
-    if len(joined) > 10000:
-        joined = joined[:10000] + "\n...[truncated]"
+    if len(joined) > 15000:
+        joined = joined[:15000] + "\n...[truncated]"
 
-    if not os.getenv("OPENAI_API_KEY"):
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set")
+    # require model key at runtime
+    if client is None:
+        raise HTTPException(status_code=501, detail="Server not configured: set OPENAI_API_KEY.")
 
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     system = (
         "You are an expert debate analyst. Be concise, neutral, and structured. "
         "Extract the main thesis and key arguments with brief evidence (use the supplied timestamps). "
@@ -179,17 +193,23 @@ def analyze(body: AnalyzeReq):
     )
 
     resp = client.chat.completions.create(
-        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        model=OPENAI_MODEL,
         temperature=0.2,
         response_format={"type": "json_object"},
         messages=[{"role":"system","content":system},{"role":"user","content":user}],
     )
-    data = json.loads(resp.choices[0].message.content)
+
+    try:
+        data = json.loads(resp.choices[0].message.content)
+    except Exception:
+        raise HTTPException(status_code=502, detail="LLM returned non-JSON")
+
     data.setdefault("video_summary", {})
     data["video_summary"]["source_url"] = body.url
     if body.title_hint and "title" not in data["video_summary"]:
         data["video_summary"]["title"] = body.title_hint
     return data
+
 
     
 

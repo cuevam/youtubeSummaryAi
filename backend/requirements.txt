@@ -1,9 +1,7 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
-
 youtube-transcript-api==0.6.2
+yt-dlp>=2024.07.16
+faster-whisper>=1.0.1
+openai>=1.40.0
 
-yt-dlp
-faster-whisper==1.0.3
-
-openai==1.40.6
