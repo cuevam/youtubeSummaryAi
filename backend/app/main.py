@@ -49,28 +49,68 @@ def _mmss(s: float) -> str:
     s = int(s); return f"{s//60:02d}:{s%60:02d}"
 
 def _whisper_fallback(url: str):
-    # 1) Download best audio
+    import base64
+
     with tempfile.TemporaryDirectory() as td:
         outtmpl = os.path.join(td, "audio.%(ext)s")
+        cookies_path = None
+
+        # Optional: pass cookies via env to handle age-restricted / member videos
+        b64 = os.environ.get("YTDLP_COOKIES_B64")
+        if b64:
+            try:
+                cookies_path = os.path.join(td, "cookies.txt")
+                with open(cookies_path, "wb") as f:
+                    f.write(base64.b64decode(b64))
+            except Exception:
+                cookies_path = None  # ignore if decoding fails
+
         ydl_opts = {
             "format": "bestaudio/best",
             "outtmpl": outtmpl,
             "quiet": True,
             "no_warnings": True,
+            "retries": 3,
+            "fragment_retries": 3,
+            "continuedl": True,
+            "nopart": True,
+            "noplaylist": True,
+            "geo_bypass": True,
             "socket_timeout": 20,
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "0",
-            }],
+            # Encourage a player client that often works better
+            "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+            # Optional user-agent if needed
+            "http_headers": {
+                "User-Agent": os.environ.get(
+                    "YTDLP_UA",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                )
+            },
         }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.extract_info(url, download=True)
+        if cookies_path:
+            ydl_opts["cookiefile"] = cookies_path
 
+        try:
+            import yt_dlp
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+        except Exception as e:
+            # Surface the error text so we can diagnose in logs/response
+            raise HTTPException(status_code=500, detail=f"yt-dlp error: {type(e).__name__}: {e}")
+
+        # Figure out the audio file path
         audio_mp3 = os.path.join(td, "audio.mp3")
-        audio_path = audio_mp3 if os.path.exists(audio_mp3) else outtmpl.replace("%(ext)s", "webm")
+        audio_webm = outtmpl.replace("%(ext)s", "webm")
+        if os.path.exists(audio_mp3):
+            audio_path = audio_mp3
+        elif os.path.exists(audio_webm):
+            audio_path = audio_webm
+        else:
+            raise HTTPException(status_code=500, detail="yt-dlp success but audio file not found")
 
-        # 2) Transcribe (CPU)
+        # Transcribe (CPU)
         model_name = os.environ.get("WHISPER_MODEL", "tiny.en")
         model = WhisperModel(model_name, device="cpu", compute_type="int8")
         segments, _ = model.transcribe(audio_path)
@@ -81,13 +121,16 @@ def _whisper_fallback(url: str):
             end = float(seg.end or start)
             text = (seg.text or "").strip()
             if text:
-                items.append({
-                    "text": text,
-                    "start": start,
-                    "ts": _mmss(start),
-                    "duration": max(0.0, end - start),
-                })
+                items.append(
+                    {
+                        "text": text,
+                        "start": start,
+                        "ts": _mmss(start),
+                        "duration": max(0.0, end - start),
+                    }
+                )
         return items
+
 
 @app.post("/transcript")
 def get_transcript(body: TranscriptReq):
