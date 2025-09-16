@@ -23,6 +23,13 @@ app = FastAPI()
 def health():
     return {"status": "ok"}
 
+from fastapi.responses import RedirectResponse  # add near the other imports
+
+@app.get("/")
+def root():
+    return RedirectResponse("/docs")
+
+
 class TranscriptReq(BaseModel):
     url: str
 
