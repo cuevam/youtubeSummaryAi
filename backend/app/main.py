@@ -49,7 +49,12 @@ def _mmss(s: float) -> str:
     s = int(s); return f"{s//60:02d}:{s%60:02d}"
 
 def _whisper_fallback(url: str):
-    import base64
+    """
+    Download best-audio with yt-dlp (optionally using cookies), find the produced file
+    robustly (regardless of extension/name), then transcribe it with faster-whisper.
+    Verbose logs can be enabled by setting env YTDLP_VERBOSE=1.
+    """
+    import base64, glob
 
     with tempfile.TemporaryDirectory() as td:
         outtmpl = os.path.join(td, "audio.%(ext)s")
@@ -62,12 +67,14 @@ def _whisper_fallback(url: str):
                 cookies_path = os.path.join(td, "cookies.txt")
                 with open(cookies_path, "wb") as f:
                     f.write(base64.b64decode(b64))
-            except Exception:
+            except Exception as e:
+                print("cookies decode failed:", type(e).__name__, flush=True)
                 cookies_path = None  # ignore if decoding fails
 
         ydl_opts = {
             "format": "bestaudio/best",
             "outtmpl": outtmpl,
+            "paths": {"home": td, "temp": td},   # ensure all files go under td
             "quiet": True,
             "no_warnings": True,
             "retries": 3,
@@ -77,9 +84,7 @@ def _whisper_fallback(url: str):
             "noplaylist": True,
             "geo_bypass": True,
             "socket_timeout": 20,
-            # Encourage a player client that often works better
             "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
-            # Optional user-agent if needed
             "http_headers": {
                 "User-Agent": os.environ.get(
                     "YTDLP_UA",
@@ -88,29 +93,92 @@ def _whisper_fallback(url: str):
                     "Chrome/120.0.0.0 Safari/537.36"
                 )
             },
+            # Prefer a pure audio file we can feed to Whisper
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "0",
+            }],
         }
+        if os.getenv("YTDLP_VERBOSE") == "1":
+            ydl_opts["quiet"] = False
+            ydl_opts["verbose"] = True
+            ydl_opts["no_warnings"] = False
+            print("YTDLP_VERBOSE=1 → enabling yt-dlp verbose logs", flush=True)
+
         if cookies_path:
             ydl_opts["cookiefile"] = cookies_path
 
+        # --- Download ---
         try:
-            import yt_dlp
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
         except Exception as e:
-            # Surface the error text so we can diagnose in logs/response
             raise HTTPException(status_code=500, detail=f"yt-dlp error: {type(e).__name__}: {e}")
 
-        # Figure out the audio file path
-        audio_mp3 = os.path.join(td, "audio.mp3")
-        audio_webm = outtmpl.replace("%(ext)s", "webm")
-        if os.path.exists(audio_mp3):
-            audio_path = audio_mp3
-        elif os.path.exists(audio_webm):
-            audio_path = audio_webm
-        else:
-            raise HTTPException(status_code=500, detail="yt-dlp success but audio file not found")
+        # Some visibility to help diagnose in logs
+        try:
+            rd = info.get("requested_downloads") or []
+        except Exception:
+            rd = []
+        print("Temp dir:", td, flush=True)
+        print("yt-dlp: filepath:", info.get("filepath"),
+              " _filename:", info.get("_filename"),
+              " requested_downloads:", [d.get("filepath") for d in rd],
+              flush=True)
+        try:
+            print("Temp dir listing:", os.listdir(td), flush=True)
+        except Exception as _e:
+            print("Listing temp dir failed:", type(_e).__name__, flush=True)
 
-        # Transcribe (CPU)
+        # --- Figure out the audio file path (robust) ---
+        audio_path = None
+        candidates = []
+
+        # 1) What yt-dlp reports directly
+        for item in rd:
+            fp = item.get("filepath")
+            if fp:
+                candidates.append(fp)
+        for key in ("filepath", "_filename", "filename"):
+            fp = info.get(key)
+            if fp:
+                candidates.append(fp)
+
+        # Also check requested_formats (sometimes present)
+        rf = info.get("requested_formats") or []
+        for fmt in rf:
+            fp = fmt.get("filepath")
+            if fp:
+                candidates.append(fp)
+
+        # 2) Common names under our temp dir
+        ext_list = ("mp3","m4a","webm","mp4","opus","wav","aac","ogg","mka","mkv","m4b")
+        for ext in ext_list:
+            candidates.append(os.path.join(td, f"audio.{ext}"))
+
+        # 3) Fallback: scan the temp dir for any media-looking files (recursive)
+        media_exts = tuple("." + e for e in ext_list)
+        for p in glob.glob(os.path.join(td, "**", "*"), recursive=True):
+            if os.path.isfile(p) and p.lower().endswith(media_exts):
+                candidates.append(p)
+
+        existing = [p for p in candidates if p and os.path.exists(p)]
+        if not existing:
+            try:
+                listing = os.listdir(td)
+            except Exception:
+                listing = []
+            raise HTTPException(
+                status_code=500,
+                detail=f"yt-dlp success but audio file not found; checked {len(candidates)} paths; tmp={listing}"
+            )
+
+        # Choose the largest existing file (safest bet)
+        audio_path = max(existing, key=lambda p: os.path.getsize(p))
+        print("Chosen audio_path:", audio_path, flush=True)
+
+        # --- Transcribe (CPU) ---
         model_name = os.environ.get("WHISPER_MODEL", "tiny.en")
         model = WhisperModel(model_name, device="cpu", compute_type="int8")
         segments, _ = model.transcribe(audio_path)
@@ -121,14 +189,13 @@ def _whisper_fallback(url: str):
             end = float(seg.end or start)
             text = (seg.text or "").strip()
             if text:
-                items.append(
-                    {
-                        "text": text,
-                        "start": start,
-                        "ts": _mmss(start),
-                        "duration": max(0.0, end - start),
-                    }
-                )
+                items.append({
+                    "text": text,
+                    "start": start,
+                    "ts": _mmss(start),
+                    "duration": max(0.0, end - start),
+                })
+
         return items
 
 
