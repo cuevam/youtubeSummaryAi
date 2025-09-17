@@ -10,4 +10,4 @@ license: mit
 ---
 
 # youtubeSummaryAi
-Extract youtube Transcipt via URL
+Extract youtube transcript via URL
