@@ -198,7 +198,19 @@ def _whisper_fallback(url: str):
 
         return items
 
+def _items_to_text(items):
+    # Join segment texts, clean spacing around punctuation
+    parts = []
+    for it in items:
+        txt = (it.get("text") or "").strip()
+        if txt:
+            parts.append(txt)
+    text = " ".join(parts)
+    text = re.sub(r"\s+([,.!?;:])", r"\1", text)
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    return text
 
+@app.post("/transcript")
 @app.post("/transcript")
 def get_transcript(body: TranscriptReq):
     vid = _extract_video_id(body.url)
@@ -227,34 +239,61 @@ def get_transcript(body: TranscriptReq):
                 raise NoTranscriptFound
 
         items = [
-            {"text": b.get("text",""), "start": float(b.get("start",0.0)),
-             "ts": _mmss(float(b.get("start",0.0))), "duration": float(b.get("duration",0.0))}
+            {
+                "text": b.get("text", ""),
+                "start": float(b.get("start", 0.0)),
+                "ts": _mmss(float(b.get("start", 0.0))),
+                "duration": float(b.get("duration", 0.0)),
+            }
             for b in blocks if b.get("text")
         ]
-        return {"video_id": vid, "source": source, "items": items}
+        return {
+            "video_id": vid,
+            "source": source,
+            "items": items,
+            "text": _items_to_text(items),   # 🔹 joined text included
+        }
 
-    except (NoTranscriptFound, TranscriptsDisabled, ParseError, RequestsConnectionError, Timeout):
+    except (NoTranscriptFound, TranscriptsDisabled, ParseError,
+            RequestsConnectionError, Timeout):
         # Fallback to Whisper
         try:
             items = _whisper_fallback(body.url)
             if not items:
-                raise HTTPException(status_code=404, detail="No transcript available and Whisper produced no text.")
-            return {"video_id": vid, "source": "whisper", "items": items}
+                raise HTTPException(
+                    status_code=404,
+                    detail="No transcript available and Whisper produced no text.",
+                )
+            return {
+                "video_id": vid,
+                "source": "whisper",
+                "items": items,
+                "text": _items_to_text(items),   # 🔹 joined text included
+            }
         except HTTPException:
             raise
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Whisper fallback error: {type(e).__name__}")
-
+            raise HTTPException(
+                status_code=500,
+                detail=f"Whisper fallback error: {type(e).__name__}",
+            )
 
     except VideoUnavailable:
         raise HTTPException(status_code=404, detail="Video unavailable or restricted.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Transcript error: {type(e).__name__}")
+
     
 
 class AnalyzeReq(BaseModel):
     url: str
     title_hint: str | None = None
+
+@app.post("/transcript_text")
+def transcript_text(body: TranscriptReq):
+    data = get_transcript(body)
+    return data["text"]
+
 
 @app.post("/analyze")
 def analyze(body: AnalyzeReq):
