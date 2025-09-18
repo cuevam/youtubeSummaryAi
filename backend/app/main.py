@@ -57,6 +57,9 @@ def _whisper_fallback(url: str):
     import base64, glob
 
     with tempfile.TemporaryDirectory() as td:
+        print("=== YT COOKIES ENV PRESENT? ",
+            bool(os.environ.get("YTDLP_COOKIES_B64")), flush=True)
+
         outtmpl = os.path.join(td, "audio.%(ext)s")
         cookies_path = None
 
@@ -210,7 +213,6 @@ def _items_to_text(items):
     text = re.sub(r"\s{2,}", " ", text).strip()
     return text
 
-@app.post("/transcript")
 @app.post("/transcript")
 def get_transcript(body: TranscriptReq):
     vid = _extract_video_id(body.url)
